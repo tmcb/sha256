@@ -15,10 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define nelem(x) (sizeof(x) / sizeof(*x))
-
-#define BLOCKSIZE 64 /* 256 / 8 */
-#define BUFSIZE (256 * BLOCKSIZE)
+#define MAXLEN		(((uint64_t)1 << (8 * sizeof(uint64_t) - 3)) - 1)
+#define BLOCKSIZE	64 /* 256 / 8 */
 
 /* SHA-256 constants (FIPS 180-4, Section 4.2.2) */
 static const uint32_t K[] = {
@@ -52,8 +50,7 @@ static const uint32_t H_0[] = {
 	0x5be0cd19, 
 };
 
-static uint64_t		preprocessing(uint8_t **, uint64_t, uint32_t []);
-static void		computation(uint8_t *, uint64_t, uint32_t []);
+static void		computation(uint8_t *, uint32_t []);
 
 static inline uint32_t	ROTR(uint32_t, uint32_t);
 static inline uint32_t	Ch(uint32_t, uint32_t, uint32_t);
@@ -67,115 +64,101 @@ static inline uint64_t	htobe64(uint64_t);
 static inline uint32_t	htobe32(uint32_t);
 
 /*
- * main() reads stdin while allocating an adequate buffer. Once the read is
- * complete, it calculates the input's SHA-256 checksum and prints it to stdout.
+ * main() calculates the input's SHA-256 checksum and prints it to stdout.
  */
 int
 main(void)
 {
-	uint64_t N = 0, l = 0;
-	uint32_t H[8];
-	uint8_t *M = NULL;
-	size_t k = 0;
+	uint64_t	 lb, l = 0;
+	uint32_t	 H[8];
+	uint8_t		 M[BLOCKSIZE];
+	size_t		 k = 0;
 
-	do {
-		if (l % BUFSIZE == 0) {
-			if ((uint64_t)(l + BUFSIZE) <= l)
-				errx(1, "%s: overflow", __func__);
-			if ((M = realloc(M, l + BUFSIZE)) == NULL)
-				err(1, "%s: realloc()", __func__);
-		}
-		k = fread(M + l, sizeof(*M), BUFSIZE - l % BUFSIZE, stdin);
-		if (k == 0 && ferror(stdin))
+#define lmod (l % sizeof(M))
+#define lpos (sizeof(M) - sizeof(l))
+#define Mrem (sizeof(M) - lmod)
+
+	memcpy(H, H_0, sizeof(H));
+	for (;;) {
+		k = fread(&M[lmod], sizeof(*M), Mrem, stdin);
+		if (ferror(stdin))
 			err(1, "%s: fread()", __func__);
 		l += k;
-	} while (!feof(stdin));
-	N = preprocessing(&M, l, H);
-	computation(M, N, H);
+		if (l > MAXLEN)
+			errx(1, "%s: overflow", __func__);
+		if (feof(stdin))
+			break;
+		if (lmod == 0)
+			computation(M, H);
+	}
+	/* SHA-256 padding (FIPS 180-4, Section 5.1.1) */
+	memset(&M[lmod], 0, Mrem);
+	M[lmod] = 01 << 7;
+	if (lmod >= lpos) {
+		computation(M, H);
+		memset(M, 0, sizeof(M));
+	}
+	lb = htobe64(8 * l);
+	memcpy(&M[lpos], &lb, sizeof(lb));
+	computation(M, H);
+
 	printf("%08" PRIx32 "%08" PRIx32 "%08" PRIx32 "%08" PRIx32
 	    "%08" PRIx32 "%08" PRIx32 "%08" PRIx32 "%08" PRIx32 "\n",
 	    H[0], H[1], H[2], H[3], H[4], H[5], H[6], H[7]);
-	free(M);
 
 	return (0);
-}
 
-/*
- * SHA-256 preprocessing (FIPS 180-4, Sections 5.1.1 and 5.2.1)
- */
-uint64_t
-preprocessing(uint8_t **M, uint64_t l, uint32_t H[])
-{
-	unsigned int i;
-	uint64_t rl, *a;
-
-	rl = 8 * (BLOCKSIZE - sizeof(uint64_t));
-	rl -= 8 * l + 1;
-	rl %= 8 * BLOCKSIZE;
-	rl += 8 * (l + sizeof(uint64_t)) + 1;
-	rl /= 8;
-	if ((uint64_t)rl <= l)
-		errx(1, "%s: overflow", __func__);
-	if ((*M = realloc(*M, rl)) == NULL)
-		err(1, "%s: realloc()", __func__);
-	memset(*M + l, 0, rl - l); 
-	(*M)[l] = 01 << 7;
-	a = (uint64_t *)(*M + rl - sizeof(uint64_t));
-	*a = htobe64(l * 8);
-	for (i = 0; i < 8; i++)
-		H[i] = H_0[i];
-
-	return rl / BLOCKSIZE;
+#undef Mrem
+#undef lpos
+#undef lmod
 }
 
 /*
  * SHA-256 hash computation (FIPS 180-4, Section 6.2.2)
  */
 void
-computation(uint8_t *M, uint64_t N, uint32_t H[])
+computation(uint8_t *M, uint32_t H[])
 {
-	unsigned int i, t;
-	uint32_t T_1, T_2;
-	uint32_t a, b, c, d, e, f, g, h;
-	uint32_t W[64];
-	uint32_t *Mi;
+	static uint32_t	 W[64];
+	unsigned int	 t;
+	uint32_t	 T_1, T_2;
+	uint32_t	 a, b, c, d, e, f, g, h;
+	uint32_t	*Mi;
 
 	Mi = (uint32_t *)M;
-	for (i = 1; i <= N; i++, Mi += BLOCKSIZE / sizeof(uint32_t)) {
-		for (t = 0; t < 16; t++)
-			W[t] = htobe32(Mi[t]);
-		for (;t < 64; t++)
-			W[t] = sigma_1(W[t - 2]) + W[t - 7] +
-			    sigma_0(W[t - 15]) + W[t - 16];
-		a = H[0];
-		b = H[1];
-		c = H[2];
-		d = H[3];
-		e = H[4];
-		f = H[5];
-		g = H[6];
-		h = H[7];
-		for (t = 0; t < 64; t++) {
-			T_1 = h + Sigma_1(e) + Ch(e, f, g) + K[t] + W[t];
-			T_2 = Sigma_0(a) + Maj(a, b, c);
-			h = g;
-			g = f;
-			f = e;
-			e = d + T_1;
-			d = c;
-			c = b;
-			b = a;
-			a = T_1 + T_2;
-		}
-		H[0] += a;
-		H[1] += b;
-		H[2] += c;
-		H[3] += d;
-		H[4] += e;
-		H[5] += f;
-		H[6] += g;
-		H[7] += h;
+	for (t = 0; t < 16; t++)
+		W[t] = htobe32(Mi[t]);
+	for (;t < 64; t++)
+		W[t] = sigma_1(W[t - 2]) + W[t - 7] +
+		    sigma_0(W[t - 15]) + W[t - 16];
+	a = H[0];
+	b = H[1];
+	c = H[2];
+	d = H[3];
+	e = H[4];
+	f = H[5];
+	g = H[6];
+	h = H[7];
+	for (t = 0; t < 64; t++) {
+		T_1 = h + Sigma_1(e) + Ch(e, f, g) + K[t] + W[t];
+		T_2 = Sigma_0(a) + Maj(a, b, c);
+		h = g;
+		g = f;
+		f = e;
+		e = d + T_1;
+		d = c;
+		c = b;
+		b = a;
+		a = T_1 + T_2;
 	}
+	H[0] += a;
+	H[1] += b;
+	H[2] += c;
+	H[3] += d;
+	H[4] += e;
+	H[5] += f;
+	H[6] += g;
+	H[7] += h;
 }
 
 /*
